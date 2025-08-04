@@ -1,4 +1,4 @@
-# ---WPS---Directory-Management-Tool
+# ---Directory-Management-Tool
 # 目录管理终端
 
 一个强大的桌面工具，旨在简化批量文件查找与整理流程，助您高效管理大量文件。
