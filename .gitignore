@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python/
+
+# Distribution / packaging
+.DS_Store
+*.egg-info/
+dist/
+build/
+*.spec
+venv/
+.venv/
+env/
+.env/
+
+# PyInstaller
+*.spec
+
+# User settings
+last_paths.ini
