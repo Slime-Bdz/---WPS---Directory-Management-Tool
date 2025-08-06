@@ -1,13 +1,15 @@
 # excel_model.py
 import os
 import pandas as pd
-from openpyxl import Workbook, load_workbook
-from PyQt5.QtCore import QAbstractTableModel, QModelIndex, Qt, QVariant
-from PyQt5.QtWidgets import QApplication, QTableView, QAbstractItemView, QHeaderView
-from PyQt5.QtGui import QClipboard, QKeySequence
+from openpyxl import Workbook
+from PyQt5.QtCore import QAbstractTableModel, QModelIndex, Qt, pyqtSignal
+from PyQt5.QtWidgets import QTableView, QApplication, QAbstractItemView
+from PyQt5.QtGui import QKeySequence
 import traceback 
 
 class ExcelTableModel(QAbstractTableModel):
+    dataChangedSignal = pyqtSignal(int, int)
+
     def __init__(self, parent=None, is_read_only=False):
         super().__init__(parent)
         self.headers = []
@@ -21,29 +23,32 @@ class ExcelTableModel(QAbstractTableModel):
             ws = wb.active
             ws.append(["文件名"])
             wb.save(path)
-        df = pd.read_excel(path, dtype=str).fillna("")
-        self.headers = df.columns.tolist()
-        self.data_list = df.values.tolist()
-        self.endResetModel()
+        try:
+            df = pd.read_excel(path, dtype=str).fillna("")
+            self.headers = df.columns.tolist()
+            self.data_list = df.values.tolist()
+        except Exception as e:
+            traceback.print_exc()
+            self.headers = ["文件名"]
+            self.data_list = []
+        finally:
+            self.endResetModel()
 
     def save(self, path):
-        if self.is_read_only:
-            return
-            
         df = pd.DataFrame(self.data_list, columns=self.headers or ["文件名"])
         df.to_excel(path, index=False)
+        
+    def append_row(self):
+        self.beginInsertRows(QModelIndex(), self.rowCount(), self.rowCount())
+        new_row = [''] * self.columnCount()
+        self.data_list.append(new_row)
+        self.endInsertRows()
 
     def rowCount(self, parent=QModelIndex()):
         return len(self.data_list)
 
     def columnCount(self, parent=QModelIndex()):
         return len(self.headers) if self.headers else 1
-
-    def headerData(self, section, orientation, role):
-        if role == Qt.DisplayRole and orientation == Qt.Horizontal:
-            if section < len(self.headers):
-                return self.headers[section]
-        return None
 
     def data(self, index, role=Qt.DisplayRole):
         if not index.isValid():
@@ -55,16 +60,19 @@ class ExcelTableModel(QAbstractTableModel):
         return None
 
     def setData(self, index, value, role=Qt.EditRole):
-        # 如果模型是只读的，直接返回 False，拒绝任何修改
-        if self.is_read_only:
-            return False
-        
-        if not index.isValid():
+        if not index.isValid() or self.is_read_only:
             return False
         
         if role == Qt.EditRole:
             try:
-                # 确保表头有足够的列，并为所有现有行扩展这些列
+                # 1. 确保目标行存在
+                while index.row() >= len(self.data_list):
+                    self.beginInsertRows(QModelIndex(), len(self.data_list), len(self.data_list))
+                    initial_cols_for_new_row = self.columnCount()
+                    self.data_list.append([''] * initial_cols_for_new_row)
+                    self.endInsertRows()
+
+                # 2. 确保表头有足够的列，并为所有现有行扩展这些列
                 while index.column() >= len(self.headers):
                     new_col_name = f"Column{len(self.headers) + 1}"
                     self.headers.append(new_col_name)
@@ -73,10 +81,10 @@ class ExcelTableModel(QAbstractTableModel):
                             self.data_list[r_idx].append('')
                     self.headerDataChanged.emit(Qt.Horizontal, len(self.headers) - 1, len(self.headers) - 1)
                 
-                # 确保目标行（data_list[index.row()]）的内部列表有足够的列
+                # 3. 确保目标行（data_list[index.row()]）的内部列表有足够的列
                 while index.row() < len(self.data_list) and index.column() >= len(self.data_list[index.row()]):
                     self.data_list[index.row()].append('')
-                    
+
                 self.data_list[index.row()][index.column()] = str(value)
                 self.dataChanged.emit(index, index, [Qt.DisplayRole, Qt.EditRole])
                 return True
@@ -84,35 +92,33 @@ class ExcelTableModel(QAbstractTableModel):
                 traceback.print_exc()
                 return False
         return False
-    
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role == Qt.DisplayRole:
+            if orientation == Qt.Horizontal:
+                if section < len(self.headers):
+                    return self.headers[section]
+                return f"Column{section + 1}"
+            if orientation == Qt.Vertical:
+                return f"{section + 1}"
+        return None
+
     def flags(self, index):
-        # 如果模型是只读的，移除 Qt.ItemIsEditable 标志
-        if self.is_read_only:
-            return Qt.ItemIsSelectable | Qt.ItemIsEnabled
-            
         if not index.isValid():
             return Qt.NoItemFlags
         
-        return Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsEditable
-
-    def _ensure_row_exists(self, target_row_index):
-        # 关键改动：在尝试创建新行之前，先检查是否为只读
         if self.is_read_only:
-            return
-            
-        # 仅当目标行索引超出当前数据列表的末尾时才插入新行
-        if target_row_index >= len(self.data_list):
-            self.beginInsertRows(QModelIndex(), len(self.data_list), target_row_index)
-            for _ in range(len(self.data_list), target_row_index + 1):
-                self.data_list.append([''] * self.columnCount())
-            self.endInsertRows()
+            return Qt.ItemIsEnabled | Qt.ItemIsSelectable
+        else:
+            return Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable
 
 class CustomTableView(QTableView):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.setSelectionBehavior(QAbstractItemView.SelectItems)
-        
+        self.setTabKeyNavigation(True)
+
     def keyPressEvent(self, event):
         if event.matches(QKeySequence.Copy):
             self.copySelected()
@@ -138,11 +144,8 @@ class CustomTableView(QTableView):
             row_data = []
             for c in range(min_col, max_col + 1):
                 index = self.model().index(r, c)
-                if r < self.model().rowCount() and c < self.model().columnCount():
-                    if index in selection:
-                        row_data.append(str(self.model().data(index, Qt.DisplayRole)))
-                    else:
-                        row_data.append('')
+                if index in selection:
+                    row_data.append(str(self.model().data(index, Qt.DisplayRole)))
                 else:
                     row_data.append('')
             table_data.append(row_data)
@@ -153,6 +156,9 @@ class CustomTableView(QTableView):
     def deleteSelected(self):
         selection = self.selectionModel().selectedIndexes()
         if not selection:
+            return
+        
+        if self.model().is_read_only:
             return
 
         min_row = min(index.row() for index in selection)
@@ -165,10 +171,12 @@ class CustomTableView(QTableView):
             for c in range(min_col, max_col + 1):
                 index = model.index(r, c)
                 if index.isValid():
-                    # 这里的 setData 调用会被模型中的 if self.is_read_only: return False 拦截
                     model.setData(index, '', Qt.EditRole)
 
     def pasteFromClipboard(self):
+        if self.model().is_read_only:
+            return
+
         clipboard = QApplication.clipboard()
         text = clipboard.text()
 
@@ -208,9 +216,6 @@ class CustomTableView(QTableView):
             
             clear_min_col = min_col
             clear_max_col = max_col
-
-        # 这里的调用现在会被模型中的 _ensure_row_exists 方法检查
-        model._ensure_row_exists(start_row + pasted_rows_count - 1)
 
         for r_offset, row_values in enumerate(rows_data):
             target_row = start_row + r_offset

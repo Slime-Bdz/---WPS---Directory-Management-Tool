@@ -1,16 +1,15 @@
+# ui_elements.py
 import os
 import sys
 import traceback
 from pathlib import Path
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QUrl, QPropertyAnimation, QEasingCurve, pyqtProperty, QRectF
+from PyQt5.QtCore import Qt, QThread, QUrl, QPropertyAnimation, QEasingCurve, pyqtProperty, QRectF, QObject, pyqtSignal
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QFileDialog,
     QTextEdit, QLabel, QSplitter, QGroupBox, QLineEdit, QTabWidget,
-    QProgressBar, QHeaderView, QTabBar, QAbstractItemView
+    QProgressBar, QHeaderView, QTabBar, QAbstractItemView, QComboBox, QApplication
 )
-from PyQt5.QtGui import QDesktopServices, QPainter, QColor
-
-# 导入拆分后的模块
+from PyQt5.QtGui import QDesktopServices, QPainter, QColor, QKeySequence
 from excel_model import ExcelTableModel, CustomTableView
 from file_operations import SearchWorker
 from utils import ensure_embedded_excels, resource_path
@@ -26,7 +25,6 @@ class SlidingTabBar(QTabBar):
         self.animation = QPropertyAnimation(self, b"current_index_animated")
         self.animation.setDuration(300)
         self.animation.setEasingCurve(QEasingCurve.OutCubic)
-
         self.currentChanged.connect(self._on_tab_changed)
 
     def _on_tab_changed(self, new_index):
@@ -57,7 +55,7 @@ class SlidingTabBar(QTabBar):
             
             indicator_height = 3
             interpolated_rect = QRectF(interpolated_x, float(left_rect.height() - indicator_height),
-                                         interpolated_width, float(indicator_height))
+                                            interpolated_width, float(indicator_height))
             
             painter.setBrush(QColor(0, 255, 255))
             painter.setPen(Qt.NoPen)
@@ -94,9 +92,10 @@ class UniApp(QWidget):
         self.start_btn = QPushButton('开始执行', self)
         self.create_refresh_excels_btn = QPushButton('创建/刷新 Excel 表', self)
         self.cancel_btn = QPushButton('取消任务', self)
+        
+        self.match_mode_combo = QComboBox(self)
 
-        self.model_origin = ExcelTableModel()
-        # --- 关键修改：为更新结果模型添加 is_read_only=True 标志 ---
+        self.model_origin = ExcelTableModel(is_read_only=False)
         self.model_updated = ExcelTableModel(is_read_only=True)
         self.view_origin = CustomTableView(self)
         self.view_updated = CustomTableView(self)
@@ -109,9 +108,7 @@ class UniApp(QWidget):
         self.progress_bar.setFormat("准备中... %p%")
         
         self.progress_label = QLabel("当前状态: 等待任务开始...")
-        # ================== 核心修改 ==================
-        self.progress_label.setWordWrap(True) # 启用自动换行
-        # ============================================
+        self.progress_label.setWordWrap(True)
         self.progress_label.setAlignment(Qt.AlignCenter)
 
         self.tab = QTabWidget()
@@ -122,6 +119,9 @@ class UniApp(QWidget):
         self.tab.addTab(self._build_excel_tab(self.model_updated, "file_list_updated.xlsx", self.view_updated), "file_list_updated.xlsx")
         self.tab.addTab(self._build_about_tab(), "关于")
         
+        self.thread = None
+        self.worker = None
+
         self._build_ui()
         self._signals()
         self._apply_styles()
@@ -145,6 +145,15 @@ class UniApp(QWidget):
             form_layout.addLayout(h_layout)
         layout.addWidget(form)
 
+        match_mode_group = QGroupBox('匹配设置')
+        match_mode_layout = QHBoxLayout(match_mode_group)
+        match_mode_label = QLabel('匹配模式:')
+        self.match_mode_combo.addItems(['精确匹配 (包含)', '模糊匹配 (85%)', '正则表达式'])
+        
+        match_mode_layout.addWidget(match_mode_label)
+        match_mode_layout.addWidget(self.match_mode_combo)
+        layout.addWidget(match_mode_group)
+
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.create_refresh_excels_btn)
         button_layout.addWidget(self.start_btn)
@@ -159,15 +168,29 @@ class UniApp(QWidget):
     def _build_excel_tab(self, model, title, view_instance):
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        
+        header_layout = QHBoxLayout()
+        header_label = QLabel(f"<b>文件预览: {title}</b>")
+        header_layout.addWidget(header_label)
+        header_layout.addStretch()
+
+        if not model.is_read_only:
+            save_btn = QPushButton("保存")
+            save_btn.clicked.connect(lambda: self.save_excel(model, title))
+            header_layout.addWidget(save_btn)
+            
+            append_btn = QPushButton("新增一行")
+            append_btn.clicked.connect(model.append_row)
+            header_layout.addWidget(append_btn)
+
+        layout.addLayout(header_layout)
+        
         view_instance.setModel(model)
         view_instance.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        layout.addWidget(view_instance)
+        view_instance.horizontalHeader().setMinimumSectionSize(120)
+        view_instance.verticalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         
-        # --- 仅为可编辑的表格添加保存按钮 ---
-        if not model.is_read_only:
-            save_btn = QPushButton(f"保存 {title}")
-            save_btn.clicked.connect(lambda: self.save_excel(model, title))
-            layout.addWidget(save_btn)
+        layout.addWidget(view_instance)
         
         return widget
 
@@ -192,7 +215,7 @@ class UniApp(QWidget):
             <h3 style='color:#00FFFF;'>特色功能：</h3>
             <ul>
                 <li style='color:#E0E0E0;'><b>Excel 驱动：：</b> 通过 Excel 列表进行批量查找与复制，告别手动操作。</li>
-                <li style='color:#E0E0E0;'><b>智能匹配：：</b> 支持文件名及“词干”匹配，提高查找成功率。</li>
+                <li style='color:#E0E0E0;'><b>智能匹配：：</b> **支持精确、模糊和正则表达式三种匹配模式，提高查找成功率。**</li>
                 <li style='color:#E0E0E0;'><b>实时报告：：</b> 即时查看成功/失败日志，任务完成后自动生成带标记的更新版 Excel 报告。</li>
                 <li style='color:#E0E0E0;'><b>内置编辑：：</b> 直接在界面中编辑 Excel 列表，支持复制、粘贴、删除单元格内容。</li>
                 <li style='color:#E0E0E0;'><b>提示：</b> 每次输入新表必须点击保存才能被应用</li>
@@ -217,7 +240,7 @@ class UniApp(QWidget):
         """)
         
         return widget
-
+        
     def _build_ui(self):
         main = QVBoxLayout(self)
 
@@ -283,9 +306,7 @@ class UniApp(QWidget):
             excel_path, updated_path = ensure_embedded_excels()
             self.load_excels()
             self.success_edit.append("✅ Excel 表格已检测并刷新。")
-            
             self.excel_le.setText(excel_path)
-
         except Exception as e:
             traceback.print_exc()
             self.fail_edit.append(f"❌ 创建/刷新 Excel 表格失败: {e}")
@@ -316,28 +337,44 @@ class UniApp(QWidget):
         with open(self.SETTINGS_FILE, "w", encoding="utf-8") as f:
             f.write("\n".join([self.excel_le.text(), self.target_le.text(), self.root_le.text()]))
 
-        self.thread = QThread()
-        
         excel_path, updated_excel_path = ensure_embedded_excels()
-        self.worker = SearchWorker(excel, target, [root], updated_excel_path)
+
+        match_mode_text = self.match_mode_combo.currentText()
+        if '模糊' in match_mode_text:
+            match_mode = 'fuzzy'
+        elif '正则' in match_mode_text:
+            match_mode = 'regex'
+        else:
+            match_mode = 'exact'
+            
+        self.worker = SearchWorker(
+            excel=excel_path,
+            target=target,
+            roots=[root],
+            updated_excel_path=updated_excel_path,
+            match_mode=match_mode,
+            min_fuzzy_score=85
+        )
         
+        self.thread = QThread(self)
         self.worker.moveToThread(self.thread)
         
         self.thread.started.connect(self.worker.run)
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.finished.connect(self.thread.wait)
-        
-        self.worker.finished.connect(self.load_excels)
         self.worker.finished.connect(self._on_task_finished)
-        
-        self.worker.success.connect(lambda s: self.success_edit.append(s))
-        self.worker.failed.connect(lambda s: self.fail_edit.append(s))
+        self.worker.finished.connect(self.thread.quit)
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.thread.finished.connect(self.thread.deleteLater)
+
+        self.worker.success.connect(self.success_edit.append)
+        self.worker.failed.connect(self.fail_edit.append)
         self.worker.progress.connect(self.update_progress)
+
+        self.cancel_btn.clicked.connect(self.worker.stop)
 
         self.thread.start()
 
     def cancel_task(self):
-        if hasattr(self, 'worker') and self.thread.isRunning():
+        if self.worker and self.thread.isRunning():
             self.worker.stop()
             self.cancel_btn.setEnabled(False)
             self.progress_label.setText("当前状态: 正在取消...")
@@ -347,17 +384,13 @@ class UniApp(QWidget):
         self.progress_bar.setMaximum(total)
         self.progress_bar.setValue(current)
         
-        # ================== 核心修改 ==================
-        # 截断路径字符串，以防止窗口被拉伸
         max_len = 50 
         display_message = message
         if len(message) > max_len:
-            # 截取前半部分并添加省略号
             display_message = message[:max_len-3] + '...'
             
         self.progress_bar.setFormat(f"{display_message} %p%")
         self.progress_label.setText(f"当前状态: {display_message}")
-        # ============================================
 
     def _on_task_finished(self):
         self.start_btn.setEnabled(True)
@@ -365,11 +398,8 @@ class UniApp(QWidget):
         self.progress_label.setText("当前状态: 任务完成。")
         self.progress_bar.setValue(self.progress_bar.maximum())
         self.progress_bar.setFormat("任务完成！ %p%")
-
-        if hasattr(self, 'thread'):
-            del self.thread
-        if hasattr(self, 'worker'):
-            del self.worker
+        
+        self.load_excels()
 
     def load_settings(self):
         excel_path, _ = ensure_embedded_excels()
@@ -509,7 +539,7 @@ QTabBar::tab {
     border-bottom: none;
     border-top-left-radius: 4px;
     border-top-right-radius: 4px;
-    min-width: 100px; /* 减小最小宽度，使页签变窄 */
+    min-width: 130px; /* 减小最小宽度，使页签变窄 */
     font-size: 10pt; /* 可以适当减小字体大小 */
     font-weight: bold;
 }
@@ -525,12 +555,14 @@ QTabBar::tab:!selected:hover {
     color: #FF00FF; /* 未选中项悬停时变为品红色 */
     border-color: #FF00FF;
 }
+
+/* 修正后的进度条样式 */
 QProgressBar {
     border: 1px solid #00FFFF;
     border-radius: 5px;
     background-color: #1A1F36;
     text-align: center;
-    color: #00FFFF;
+    color: #1A1F36; /* 这里修改为深色，与进度条填充色形成对比 */
 }
 
 QProgressBar::chunk {
@@ -544,5 +576,31 @@ QLabel#progress_label {
     font-weight: bold;
     padding: 5px;
 }
+QComboBox {
+    border: 1px solid #00FFFF;
+    border-radius: 4px;
+    padding: 4px;
+    background-color: #1A1F36;
+    color: #00FFFF;
+}
+
+QComboBox::drop-down {
+    border: 0px;
+}
+
+QComboBox::down-arrow {
+    image: url(resource_path('down_arrow.png'));
+    width: 12px;
+    height: 12px;
+}
+
+QComboBox QAbstractItemView {
+    border: 1px solid #00FFFF;
+    background-color: #1A1F36;
+    color: #E0E0E0;
+    selection-background-color: #00FFFF;
+    selection-color: #1A1F36;
+}
+
 """)
         self.progress_label.setObjectName("progress_label")

@@ -2,11 +2,67 @@
 import os
 import shutil
 import traceback
+import re
 from pathlib import Path
-import concurrent.futures
-from PyQt5.QtCore import QObject, pyqtSignal
 from openpyxl import load_workbook, Workbook
 from openpyxl.styles import PatternFill
+from fuzzywuzzy import fuzz
+import concurrent.futures
+from PyQt5.QtCore import QObject, pyqtSignal
+
+def _scan_root_process(root_dir, names_to_find_set, match_mode, min_fuzzy_score):
+    """
+    一个独立的、可被多进程调用的函数，用于在单个根目录中查找文件。
+    该函数只接受可被序列化的参数。
+    """
+    found_files = {}
+    
+    if not os.path.exists(root_dir):
+        return found_files
+
+    # 预处理，提高查找效率
+    if match_mode == 'regex':
+        try:
+            # 预编译所有正则表达式
+            regex_patterns = {name: re.compile(name) for name in names_to_find_set}
+        except re.error:
+            # 如果正则表达式无效，返回空结果
+            return found_files
+    
+    for dirpath, _, filenames in os.walk(root_dir):
+        current_dir_files_set = set(filenames)
+
+        if match_mode == 'exact':
+            # 修正：将精确匹配改为子字符串匹配，符合“包含”的定义
+            for name_to_find in names_to_find_set:
+                if name_to_find not in found_files:
+                    for filename in current_dir_files_set:
+                        if name_to_find in filename:
+                            found_files[name_to_find] = str(Path(dirpath) / filename)
+                            break
+        
+        elif match_mode == 'fuzzy':
+            # 模糊匹配需要逐一检查
+            for filename in current_dir_files_set:
+                for name_to_find in names_to_find_set:
+                    if name_to_find not in found_files:
+                        if fuzz.ratio(name_to_find, filename) >= min_fuzzy_score:
+                            found_files[name_to_find] = str(Path(dirpath) / filename)
+                            break
+        
+        elif match_mode == 'regex':
+            for filename in current_dir_files_set:
+                for name_to_find, pattern in regex_patterns.items():
+                    if name_to_find not in found_files:
+                        if pattern.search(filename):
+                            found_files[name_to_find] = str(Path(dirpath) / filename)
+                            break
+        
+        # 如果已经找到所有文件，则提前退出
+        if len(found_files) == len(names_to_find_set):
+            break
+    
+    return found_files
 
 class SearchWorker(QObject):
     finished = pyqtSignal()
@@ -16,17 +72,22 @@ class SearchWorker(QObject):
     
     _is_stopped = False
 
-    def __init__(self, excel, target, roots, updated_excel_path):
-        super().__init__()
+    def __init__(self, excel, target, roots, updated_excel_path, match_mode='exact', min_fuzzy_score=85, parent=None):
+        super().__init__(parent)
         self.excel = excel
         self.target = target
         self.roots = roots
         self.updated_excel_path = updated_excel_path
+        self.match_mode = match_mode
+        self.min_fuzzy_score = min_fuzzy_score
         self._is_stopped = False
+        self.executor = None
 
     def stop(self):
         self._is_stopped = True
         self.failed.emit("用户请求取消任务，正在停止...")
+        if self.executor:
+            self.executor.shutdown(wait=False, cancel_futures=True)
 
     def run(self):
         try:
@@ -56,10 +117,51 @@ class SearchWorker(QObject):
                 return {'status': 'failed', 'message': f"❌ 复制失败 ({name_to_find}): {e}", 'name': name_to_find}
         else:
             return {'status': 'failed', 'message': f"❌ 未找到: {name_to_find}", 'name': name_to_find}
+    
+    def _find_files_in_roots(self, names_to_find_set):
+        """并行扫描多个根目录并汇总结果。"""
+        combined_found_files = {}
+        total_roots = len(self.roots)
+        completed_roots = 0
+        
+        with concurrent.futures.ProcessPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
+            self.executor = executor
+            futures = {
+                executor.submit(_scan_root_process, root, names_to_find_set, self.match_mode, self.min_fuzzy_score): root
+                for root in self.roots
+            }
+            
+            for future in concurrent.futures.as_completed(futures):
+                if self._is_stopped:
+                    for f in futures:
+                        f.cancel()
+                    break
+                
+                try:
+                    result = future.result()
+                    for name, path in result.items():
+                        if name not in combined_found_files:
+                            combined_found_files[name] = path
+                            self.success.emit(f"🔍 找到文件: {name}")
+                except Exception as e:
+                    root_dir = futures[future]
+                    self.failed.emit(f"❌ 扫描目录 {root_dir} 发生错误: {e}")
+                
+                completed_roots += 1
+                search_progress_value = int((completed_roots / total_roots) * 70)
+                self.progress.emit(search_progress_value, 100, f"🔎 正在扫描: {completed_roots}/{total_roots} 个目录")
+                
+                if len(combined_found_files) == len(names_to_find_set):
+                    self.success.emit("✅ 已找到所有文件，提前结束搜索。")
+                    for f in futures:
+                        f.cancel()
+                    break
+        
+        self.executor = None
+        return combined_found_files
 
     def _work(self):
         self.progress.emit(0, 100, "⚙️ 正在初始化...")
-        
         os.makedirs(self.target, exist_ok=True)
         
         try:
@@ -72,82 +174,30 @@ class SearchWorker(QObject):
                 if row and row[0] is not None
             ]
             names_to_find = [name for name in names_to_find if name]
+            names_to_find_set = set(names_to_find)
 
         except Exception as e:
             self.failed.emit(f"❌ 无法读取 Excel 文件: {self.excel} - {e}")
             return
 
-        if not names_to_find:
+        if not names_to_find_set:
             self.progress.emit(100, 100, "⚠️ Excel 中未找到文件名。")
             return
-
-        # ==================== 1. 搜索阶段 (0% - 70%) ====================
+        
         self.success.emit(f"🔎 开始在 {len(self.roots)} 个目录中查找 {len(names_to_find)} 个文件...")
+
+        found_files = self._find_files_in_roots(names_to_find_set)
         
-        # 预先计算总共需要遍历的目录数量，以便实现平滑的进度条
-        total_dirs_to_scan = 0
-        for root in self.roots:
-            if os.path.exists(root):
-                total_dirs_to_scan += sum(1 for _ in os.walk(root))
-
-        if total_dirs_to_scan == 0:
-            self.progress.emit(70, 100, "⚠️ 搜索根目录为空或不存在。")
-        
-        dirs_scanned_count = 0
-        found_files = {}
-
-        for root in self.roots:
-            if self._is_stopped:
-                self.failed.emit("任务已中断。")
-                return
-
-            if not os.path.exists(root):
-                self.failed.emit(f"❌ 查找根目录不存在: {root}")
-                dirs_scanned_count += 1
-                continue
-
-            for dirpath, dirnames, filenames in os.walk(root):
-                if self._is_stopped:
-                    self.failed.emit("任务已中断。")
-                    return
-                
-                dirs_scanned_count += 1
-                
-                # 计算搜索阶段的进度 (0% - 70%)
-                if total_dirs_to_scan > 0:
-                    search_progress_value = int((dirs_scanned_count / total_dirs_to_scan) * 70)
-                    self.progress.emit(search_progress_value, 100, f"🔎 正在扫描: {dirpath}")
-                else:
-                    # 如果根目录为空，进度条直接到70%
-                    self.progress.emit(70, 100, "🔎 搜索完成")
-                
-                for filename in filenames:
-                    if len(found_files) == len(names_to_find):
-                        # 所有文件已找到，提前退出当前目录的遍历
-                        break
-                    
-                    for name_to_find in names_to_find:
-                        if name_to_find in filename and name_to_find not in found_files:
-                            found_files[name_to_find] = str(Path(dirpath) / filename)
-                            self.success.emit(f"🔍 找到文件: {name_to_find}")
-                            break
-            
-            if len(found_files) == len(names_to_find):
-                self.success.emit("✅ 已找到所有文件，提前结束搜索。")
-                break
-        
-        # 确保搜索阶段的进度条达到70%
         self.progress.emit(70, 100, "✅ 搜索阶段完成，准备复制文件...")
         
         if self._is_stopped:
             self.failed.emit("任务已中断。")
             return
             
-        # ==================== 2. 复制阶段 (70% - 100%) ====================
         total_files_to_process = len(names_to_find)
         copied_count = 0
         copy_results = []
-
+        
         if total_files_to_process > 0:
             self.progress.emit(70, 100, "📁 正在并发复制文件...")
             
@@ -177,7 +227,6 @@ class SearchWorker(QObject):
                     except Exception as e:
                         self.failed.emit(f"❌ 任务处理异常: {e}")
                     
-                    # 复制阶段的进度，从70%到100%
                     copy_progress_value = 70 + int((copied_count / total_files_to_process) * 30)
                     self.progress.emit(copy_progress_value, 100, f"🚀 正在复制文件: {copied_count}/{total_files_to_process}")
         else:
