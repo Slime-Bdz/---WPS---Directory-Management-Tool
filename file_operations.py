@@ -1,6 +1,6 @@
-"""
-file_operations.py
+# file_operations.py
 
+"""
 该模块包含所有核心的文件操作逻辑，包括多进程的文件查找、
 多线程的文件复制以及生成 Excel 报告。
 """
@@ -16,51 +16,20 @@ from openpyxl import load_workbook, Workbook
 from openpyxl.styles import PatternFill
 from fuzzywuzzy import fuzz
 import pandas as pd
+from utils import resource_path # 注意：需要确保 utils.py 中包含 resource_path 函数
 
 # ----------------------------------------------------------------------
 # 路径管理 - 在打包后也能够正确找到资源文件
 # ----------------------------------------------------------------------
-def resource_path(relative_path):
-    """
-    获取资源文件的绝对路径，以兼容 PyInstaller 打包后的环境。
-    """
-    try:
-        # PyInstaller creates a temp folder and stores path in _MEIPASS
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(".")
-    return os.path.join(base_path, relative_path)
+# 注意：此函数已在 utils.py 中定义，为了保持单一来源，
+#       此处不再重复定义，而是从 utils.py 导入。
+#       请确保你的 utils.py 文件中包含 resource_path 函数。
 
 # ----------------------------------------------------------------------
 # 文件系统设置 - 自动创建资源文件夹和默认 Excel 文件
 # ----------------------------------------------------------------------
-def setup_excel_files():
-    """
-    检查并创建程序所需的 resources 文件夹和默认 Excel 文件。
-    如果文件不存在，将创建包含默认表头的空文件。
-    """
-    resources_dir = resource_path('resources')
-    file_list_path = os.path.join(resources_dir, 'file_list.xlsx')
-    file_list_updated_path = os.path.join(resources_dir, 'file_list_updated.xlsx')
-
-    # 1. 检查并创建 resources 文件夹
-    if not os.path.exists(resources_dir):
-        os.makedirs(resources_dir)
-        print(f"Created resources directory at: {resources_dir}")
-
-    # 2. 检查并创建 file_list.xlsx
-    if not os.path.exists(file_list_path):
-        print(f"File not found: {file_list_path}. Creating new file...")
-        df = pd.DataFrame(columns=['文件名'])
-        df.to_excel(file_list_path, index=False)
-        print("Created default file_list.xlsx with a header.")
-
-    # 3. 检查并创建 file_list_updated.xlsx
-    if not os.path.exists(file_list_updated_path):
-        print(f"File not found: {file_list_updated_path}. Creating new file...")
-        df = pd.DataFrame(columns=['文件名'])
-        df.to_excel(file_list_updated_path, index=False)
-        print("Created default file_list_updated.xlsx with a header.")
+# 注意：setup_excel_files 函数已从本模块移除，
+#       因为它属于主进程的初始化任务。请在 main_app.py 中调用此函数。
 
 
 def _scan_root_process(root_dir, names_to_find_set, match_mode, min_fuzzy_score):
@@ -217,7 +186,8 @@ class SearchWorker(QObject):
         os.makedirs(self.target_dir, exist_ok=True)
 
         try:
-            # 这里不需要修改，你的主程序会调用 setup_excel_files 来确保文件存在
+            # 确保 excel_path 存在。
+            # 这里是加载，而不是创建。
             wb_original = load_workbook(self.excel_path)
             ws_original = wb_original.active
 
@@ -246,7 +216,7 @@ class SearchWorker(QObject):
             return
 
         copy_results = self._copy_files(names_to_find, found_files)
-        
+
         if not self._is_stopped:
             self._finalize_excel_report(self.updated_excel_path, names_to_find, copy_results)
             self.progress.emit(100, 100, "任务完成。")
@@ -268,12 +238,12 @@ class SearchWorker(QObject):
         with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() * 2 or 4) as executor:
             futures = [executor.submit(self._copy_single_file, name, found_files.get(name), self.target_dir)
                        for name in names_to_find]
-            
+
             for future in concurrent.futures.as_completed(futures):
                 if self._is_stopped:
                     executor.shutdown(wait=False, cancel_futures=True)
                     break
-                
+
                 copied_count += 1
                 try:
                     result = future.result()
@@ -287,12 +257,16 @@ class SearchWorker(QObject):
 
                 copy_progress_value = 70 + int((copied_count / total_files_to_process) * 30)
                 self.progress.emit(copy_progress_value, 100, f"🚀 正在复制文件: {copied_count}/{total_files_to_process}")
-        
+
         return copy_results
 
     def _finalize_excel_report(self, updated_excel_path, names_to_find, copy_results):
         """生成并保存最终的 Excel 报告。"""
         try:
+            # 确保 updated_excel_path 的父目录存在
+            os.makedirs(os.path.dirname(updated_excel_path), exist_ok=True)
+            
+            # 检查文件是否已存在，不存在则创建
             if not os.path.exists(updated_excel_path):
                 wb = Workbook()
                 ws = wb.active
@@ -305,9 +279,7 @@ class SearchWorker(QObject):
 
             results_map = {res['name']: res for res in copy_results}
 
-            for _ in range(len(names_to_find) - ws.max_row):
-                ws.append(['', ''])
-
+            # 写入或更新每一行数据
             for idx, name_to_find in enumerate(names_to_find):
                 row_index = idx + 2
                 result = results_map.get(name_to_find)
